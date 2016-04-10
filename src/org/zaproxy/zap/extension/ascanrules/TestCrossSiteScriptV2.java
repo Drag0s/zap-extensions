@@ -18,6 +18,8 @@
 package org.zaproxy.zap.extension.ascanrules;
 
 import java.util.List;
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
 import java.net.UnknownHostException;
 
 import org.apache.commons.httpclient.InvalidRedirectLocationException;
@@ -401,6 +403,331 @@ public class TestCrossSiteScriptV2 extends AbstractAppParamPlugin {
         } catch (Exception e) {
             log.error(e.getMessage(), e);
         }
+        if (!nameisVuln) scanName(msg, value);
+    }
+    
+    private List<HtmlContext> performNameAttack (HttpMessage msg, String attack, String value,
+    		HtmlContext targetContext, int ignoreFlags) {
+    	 if (isStop()) {
+             return null;
+         }
+
+ 		HttpMessage msg2 = msg.cloneRequest();
+ 		String encodedAttack = "";
+ 		try {
+ 			encodedAttack = URLEncoder.encode(attack, "UTF8");
+	    } catch (UnsupportedEncodingException e) {
+	        e.printStackTrace();
+	    }
+ 		setParameter(msg2, encodedAttack, value);
+         try {
+ 			sendAndReceive(msg2);
+     	} catch (InvalidRedirectLocationException|UnknownHostException e) {
+     		// Not an error, just means we probably attacked the redirect location
+ 		} catch (Exception e) {
+ 			log.error(e.getMessage(), e);
+ 		}
+
+         if (isStop()) {
+             return null;
+         }
+
+         HtmlContextAnalyser hca = new HtmlContextAnalyser(msg2);
+         if (Plugin.AlertThreshold.HIGH.equals(this.getAlertThreshold())) {
+         	// High level, so check all results are in the expected context
+         	return hca.getHtmlContexts(attack, targetContext, ignoreFlags);
+         }
+         return hca.getHtmlContexts(attack);
+    }
+   
+   
+    private void scanName (HttpMessage msg, String value) {
+    	try {
+	    	// Inject the 'safe' eyecatcher and see where it appears
+			
+			boolean attackWorked = false;
+            HttpMessage msg2 = getNewMsg();
+			setParameter(msg2, Constant.getEyeCatcher(), value);
+            try {
+    			sendAndReceive(msg2);
+        	} catch (InvalidRedirectLocationException|UnknownHostException e) {
+        		// Not an error, just means we probably attacked the redirect location
+        		// Try the second eye catcher
+        	}
+            
+            if (isStop()) {
+                return;
+            }
+
+            HtmlContextAnalyser hca = new HtmlContextAnalyser(msg2);
+            List<HtmlContext> contexts = hca.getHtmlContexts(Constant.getEyeCatcher(), null, 0);
+            if (contexts.size() == 0) {
+            	// Lower case?
+                contexts = hca.getHtmlContexts(Constant.getEyeCatcher().toLowerCase(), null, 0);
+            }
+            if (contexts.size() == 0) {
+            	// Upper case?
+                contexts = hca.getHtmlContexts(Constant.getEyeCatcher().toUpperCase(), null, 0);
+            }
+            if (contexts.size() == 0) {
+            	// No luck - try again, appending the eyecatcher to the original value
+    			msg2 = getNewMsg();
+    			setParameter(msg2, value + Constant.getEyeCatcher(), value);
+                try {
+        			sendAndReceive(msg2);
+            	} catch (InvalidRedirectLocationException|UnknownHostException e) {
+            		//Second eyecatcher failed for some reason, no need to continue
+            		return;
+            	}              
+                hca = new HtmlContextAnalyser(msg2);
+            	contexts = hca.getHtmlContexts(value + Constant.getEyeCatcher(), null, 0);
+            }
+            if (contexts.size() == 0) {
+            	// No luck - lets just try a direct attack
+	            List<HtmlContext> contexts2 = performNameAttack (msg, "'\"<script>alert(1);</script>", 
+	            		value, null, 0);
+                if (contexts2 == null) {
+                    return;
+                }
+	            if (contexts2.size() > 0) {
+            		// Yep, its vulnerable
+					bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_LOW, null, "'\"<script>alert(1);</script>", value, 
+							"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+					attackWorked = true;
+					nameisVuln = true;
+	            }
+            }
+            
+            for (HtmlContext context : contexts) {
+            	// Loop through the returned contexts and launch targeted attacks
+            	if (attackWorked || isStop()) {
+            		break;
+            	}
+            	if (context.getTagAttribute() != null) {
+            		// its in a tag attribute - lots of attack vectors possible
+         
+        			if (context.isInScriptAttribute()) {
+            			// Good chance this will be vulnerable
+        				// Try a simple alert attack
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, ";alert(1)", value, context, 0);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            
+        	            for (HtmlContext context2 : contexts2) {
+        	            	if (context2.getTagAttribute() != null &&
+        	            			context2.isInScriptAttribute()) {
+        	            		// Yep, its vulnerable
+        						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, ";alert(1)", value, 
+        								"", contexts2.get(0).getTarget(), context2.getMsg());
+        						attackWorked = true;
+        						nameisVuln = true;
+        						break;
+        	            	}
+        	            }
+        	            if (!attackWorked) {
+        	            	log.debug("Failed to find vuln in script attribute on " + msg.getRequestHeader().getURI());
+        	            }
+
+        			} else if (context.isInUrlAttribute()) {
+        				// Its a url attribute
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, "javascript:alert(1);", value, context, 0);
+                        if (contexts2 == null) {
+                            break;
+                        }
+
+        	            for (HtmlContext ctx : contexts2) {
+        	            	if (ctx.isInUrlAttribute()) {
+        	            		// Yep, its vulnerable
+        						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "javascript:alert(1);", value, 
+        							"", ctx.getTarget(), ctx.getMsg());
+        						attackWorked = true;
+        						nameisVuln = true;
+        	            		break;
+        	            	}
+        	            }
+        	            if (!attackWorked) {
+        	            	log.debug("Failed to find vuln in url attribute on " + msg.getRequestHeader().getURI());
+        	            }
+
+        			}
+            		if (! attackWorked && context.isInTagWithSrc()) {
+            			// Its in an attribute in a tag which supports src attributes
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, context.getSurroundingQuote() + " src=http://badsite.com", 
+        	            		value, context, HtmlContext.IGNORE_TAG);
+                        if (contexts2 == null) {
+                            break;
+                        }
+
+        	            if (contexts2.size() > 0) {
+    						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, context.getSurroundingQuote() + " src=http://badsite.com", value, 
+    							"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+    						attackWorked = true;
+    						nameisVuln = true;
+        	            }
+        	            if (!attackWorked) {
+        	            	log.debug("Failed to find vuln in tag with src attribute on " + msg.getRequestHeader().getURI());
+        	            }
+            		}
+        			
+        			if (! attackWorked) {
+        				// Try a simple alert attack
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, context.getSurroundingQuote() + "><script>alert(1);</script>", 
+        	            		value, context, HtmlContext.IGNORE_TAG);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            if (contexts2.size() > 0) {
+    	            		// Yep, its vulnerable
+    						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, context.getSurroundingQuote() + "><script>alert(1);</script>", value, 
+    								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+    						attackWorked = true;
+    						nameisVuln = true;
+        	            }
+        	            if (!attackWorked) {
+        	            	log.debug("Failed to find vuln with simple script attack " + msg.getRequestHeader().getURI());
+        	            }
+        			}
+        			if (! attackWorked) {
+	            		// Try adding an onMouseOver
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, context.getSurroundingQuote() + " onMouseOver=" + context.getSurroundingQuote() + "alert(1);", 
+        	            		value, 
+        	            		context, HtmlContext.IGNORE_TAG);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            if (contexts2.size() > 0) {
+    	            		// Yep, its vulnerable
+    						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, context.getSurroundingQuote() + " onMouseOver=" + context.getSurroundingQuote() + "alert(1);", value, 
+    								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+    						attackWorked = true;
+    						nameisVuln = true;
+    	            	}
+        	            if (!attackWorked) {
+        	            	log.debug("Failed to find vuln in with simple onmounseover " + msg.getRequestHeader().getURI());
+        	            }
+        			}
+            	} else if (context.isHtmlComment()) {
+            		// Try breaking out of the comment
+    	            List<HtmlContext> contexts2 = performNameAttack (msg, "--><script>alert(1);</script><!--", 
+    	            		value, context, HtmlContext.IGNORE_HTML_COMMENT);
+                    if (contexts2 == null) {
+                        break;
+                    }
+    	            if (contexts2.size() > 0) {
+	            		// Yep, its vulnerable
+						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "--><script>alert(1);</script><!--", value, 
+								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+						attackWorked = true;
+						nameisVuln = true;
+    	            } else {
+    	            	// Maybe they're blocking script tags
+        	            contexts2 = performNameAttack (msg, "--><b onMouseOver=alert(1);>test</b><!--", 
+			            		value, context, HtmlContext.IGNORE_HTML_COMMENT);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            if (contexts2.size() > 0) {
+		            		// Yep, its vulnerable
+							bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "--><b onMouseOver=alert(1);>test</b><!--", value, 
+									"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+							attackWorked = true;
+							nameisVuln = true;
+			            }
+    	            }
+            	} else {
+            		// its not in a tag attribute
+            		if ("body".equalsIgnoreCase(context.getParentTag())) {
+            			// Immediately under a body tag
+        				// Try a simple alert attack
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, "<script>alert(1);</script>", 
+        	            		value, null, HtmlContext.IGNORE_PARENT);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            if (contexts2.size() > 0) {
+        	            		// Yep, its vulnerable
+        						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "<script>alert(1);</script>", value, 
+        								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+        						attackWorked = true;
+        						nameisVuln = true;
+        	            } else {
+        	            	// Maybe they're blocking script tags
+            	            contexts2 = performNameAttack (msg, "<b onMouseOver=alert(1);>test</b>", 
+    			            		value, context, HtmlContext.IGNORE_PARENT);
+                            if (contexts2 == null) {
+                                break;
+                            }
+    			            for (HtmlContext context2 : contexts2) {
+    			            	if ("body".equalsIgnoreCase(context2.getParentTag()) ||
+    			            			"script".equalsIgnoreCase(context2.getParentTag())) {
+    			            		// Yep, its vulnerable
+    								bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "<b onMouseOver=alert(1);>test</b>", value, 
+    										"TBI Body tag", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+    								attackWorked = true;
+    								nameisVuln = true;
+    								break;
+    			            	}
+    			            }
+        	            }
+            		} else if (context.getParentTag() != null){
+            			// Its not immediately under a body tag, try to close the tag
+        	            List<HtmlContext> contexts2 = performNameAttack (msg, "</" + context.getParentTag() + "><script>alert(1);</script><" + context.getParentTag() + ">", 
+        	            		value, 
+        	            		context, HtmlContext.IGNORE_IN_SCRIPT);
+                        if (contexts2 == null) {
+                            break;
+                        }
+        	            if (contexts2.size() > 0) {
+       	            		// Yep, its vulnerable
+       						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "</" + context.getParentTag() + "><script>alert(1);</script><" + context.getParentTag() + ">", value, 
+       								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+    						attackWorked = true;
+    						nameisVuln = true;
+        	            } else if ("script".equalsIgnoreCase(context.getParentTag())){
+        	            	// its in a script tag...
+            	            contexts2 = performNameAttack (msg, context.getSurroundingQuote() + ";alert(1);" + context.getSurroundingQuote(), 
+            	            		value, context, 0);
+                            if (contexts2 == null) {
+                                break;
+                            }
+            	            if (contexts2.size() > 0) {
+           	            		// Yep, its vulnerable
+           						bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, context.getSurroundingQuote() + ";alert(1);" + context.getSurroundingQuote(), value, 
+           								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+        						attackWorked = true;
+        						nameisVuln = true;
+            	            }
+        	            }
+            		} else {
+            			// Last chance - is the payload actually the whole response?
+            			if (context.getTarget().equals(context.getMsg().getResponseBody().toString())) {
+            	            List<HtmlContext> contexts2 = performNameAttack (msg, "<script>alert(1);</script>", 
+            	            		value, null, 0);
+                            if (contexts2 == null) {
+                                break;
+                            }
+            	            if (contexts2.size() > 0) {
+           	            		// Yep, its vulnerable
+                    			if (contexts2.get(0).getMsg().getResponseHeader().isHtml()) {
+                    				bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_MEDIUM, null, "<script>alert(1);</script>", value,
+           								"", contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+                    			} else {
+                    				bingo(Alert.RISK_HIGH, Alert.CONFIDENCE_LOW, null, "<script>alert(1);</script>", value,
+                   						Constant.messages.getString(MESSAGE_PREFIX + "otherinfo.nothtml"),
+           								contexts2.get(0).getTarget(), contexts2.get(0).getMsg());
+                    				
+                    			}
+        						attackWorked = true;
+        						nameisVuln = true;
+            	            }
+            			}
+            		}
+            	}
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+        }   	
     }
     
 	@Override
